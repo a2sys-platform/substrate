@@ -51,7 +51,17 @@ const (
 	// fixed for the Server's lifetime, so this lets the port vary per
 	// request; stripped before the request reaches the actor.
 	TargetPortHeader = "X-Ate-Target-Port"
+
+	// ControlPort is the CONNECT port atunnel answers itself instead of
+	// relaying to the actor. A caller the router admits to the actor sends
+	// POST /<operation> there. tcpmux's port: nothing in an actor is expected
+	// to listen on it.
+	ControlPort = 1
 )
+
+// ControlFunc runs one control operation for the actor with the given UID and
+// returns the line to answer with.
+type ControlFunc func(ctx context.Context, actorUID, op string) string
 
 // ParsePort parses s as a TCP port number, returning ok=false for anything
 // outside the valid 1-65535 range (including non-numeric input).
@@ -72,6 +82,9 @@ type Config struct {
 	TrustBundlePath      string
 	AllowedClientID      string
 	Upstream             *url.URL
+	// Control answers CONNECTs to ControlPort. Nil relays that port to the
+	// actor like any other.
+	Control ControlFunc
 }
 
 // Server is an HTTPS reverse proxy for the worker's active actors.
@@ -79,6 +92,7 @@ type Server struct {
 	credentialBundlePath string
 	tlsConfig            *tls.Config
 	upstream             *url.URL
+	control              ControlFunc
 	// Overridable by tests to avoid dialing real sandboxes.
 	newProxy func(DialFunc) *httputil.ReverseProxy
 
@@ -130,6 +144,7 @@ func NewServer(cfg Config) (*Server, error) {
 	s := &Server{
 		credentialBundlePath: cfg.CredentialBundlePath,
 		upstream:             cfg.Upstream,
+		control:              cfg.Control,
 		active:               map[resources.ActorRef]*activation{},
 	}
 	s.newProxy = func(dial DialFunc) *httputil.ReverseProxy {
@@ -342,19 +357,25 @@ func (s *Server) serveConnectHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CONNECT authority must include a port", http.StatusBadRequest)
 		return
 	}
-	if _, ok := ParsePort(port); !ok {
+	portNumber, ok := ParsePort(port)
+	if !ok {
 		slog.DebugContext(r.Context(), "atunnel CONNECT rejected: invalid port", slog.Any("actor", active.ref), slog.String("authority", r.Host))
 		http.Error(w, "invalid CONNECT port", http.StatusBadRequest)
 		return
 	}
 
-	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
-	defer cancelDial()
-	upstream, err := active.dial(dialCtx, "tcp", net.JoinHostPort(s.upstream.Hostname(), port))
-	if err != nil {
-		slog.WarnContext(r.Context(), "atunnel CONNECT upstream failed", slog.Any("actor", active.ref), slog.String("port", port), slog.Any("err", err))
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+	var upstream net.Conn
+	if portNumber == ControlPort && s.control != nil {
+		upstream = s.controlConn(active.uid)
+	} else {
+		dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelDial()
+		upstream, err = active.dial(dialCtx, "tcp", net.JoinHostPort(s.upstream.Hostname(), port))
+		if err != nil {
+			slog.WarnContext(r.Context(), "atunnel CONNECT upstream failed", slog.Any("actor", active.ref), slog.String("port", port), slog.Any("err", err))
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
 	}
 	defer upstream.Close()
 
@@ -366,6 +387,66 @@ func (s *Server) serveConnectHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.serveH1Connect(w, upstream, ctx, log)
 }
+
+// controlConn returns the tunnel end of a connection whose other end is an
+// HTTP server for the actor's control operations: POST /<operation> answers
+// 200 with the operation's answer line, or 502 when the answer is an error.
+// The router only carries HTTP inside a CONNECT tunnel, so the control port
+// speaks HTTP like an actor's own port would.
+func (s *Server) controlConn(actorUID string) net.Conn {
+	tunnel, served := net.Pipe()
+	closed := make(chan struct{})
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols:         &protocols,
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", http.StatusMethodNotAllowed)
+				return
+			}
+			answer := s.control(r.Context(), actorUID, strings.TrimPrefix(r.URL.Path, "/"))
+			if strings.HasPrefix(answer, "err") {
+				http.Error(w, answer, http.StatusBadGateway)
+				return
+			}
+			_, _ = io.WriteString(w, answer+"\n")
+		}),
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed || state == http.StateHijacked {
+				select {
+				case <-closed:
+				default:
+					close(closed)
+				}
+			}
+		},
+	}
+	go func() { _ = server.Serve(&singleConnListener{conn: served, closed: closed}) }()
+	return tunnel
+}
+
+// singleConnListener hands out one connection, then blocks until it closes.
+type singleConnListener struct {
+	conn   net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	var conn net.Conn
+	l.once.Do(func() { conn = l.conn })
+	if conn != nil {
+		return conn, nil
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *singleConnListener) Close() error   { return nil }
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 
 func (s *Server) serveH1Connect(w http.ResponseWriter, upstream net.Conn, ctx context.Context, log *slog.Logger) {
 	hj, ok := w.(http.Hijacker)

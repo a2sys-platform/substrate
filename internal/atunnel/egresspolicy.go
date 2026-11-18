@@ -73,12 +73,27 @@ type actorEgressPolicy struct {
 // ActorEgressPolicy returns the source of actor's egress policy for its DNS
 // relay.
 func (t *Tunnel) ActorEgressPolicy(actor resources.ActorAttribution) dns.PolicySource {
-	return &actorEgressPolicy{
+	source := &actorEgressPolicy{
 		fetch: t.fetchEgressPolicy(actor),
 		ttl:   egressPolicyTTL,
 		now:   time.Now,
 		log:   slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
 	}
+	// Kept so a policy read for the actor's watch also replaces what its DNS
+	// relay has cached.
+	t.mu.Lock()
+	t.dnsPolicies[actor.UID] = source
+	t.mu.Unlock()
+	return source
+}
+
+// refresh reads the policy now, whatever the cache holds, and caches the result.
+func (p *actorEgressPolicy) refresh(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+	policy, err := p.fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return p.record(ctx, policy, nil)
 }
 
 // fetchEgressPolicy returns a function that reads actor's egress policy from

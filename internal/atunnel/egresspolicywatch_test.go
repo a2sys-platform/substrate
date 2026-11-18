@@ -168,3 +168,33 @@ func TestEgressPolicyWatchSeesAChangeMadeWhileFetchesFailed(t *testing.T) {
 		t.Fatal("no reset once the removed policy could be read")
 	}
 }
+
+func TestEgressPolicyWatchControl(t *testing.T) {
+	policy := policyOf(passthrough(allPorts, "*"))
+	var fetchErr error
+	resets := 0
+	watch := &egressPolicyWatch{
+		fetch: func(context.Context) (*ateletpb.EgressPolicy, error) { return policy, fetchErr },
+		reset: func() { resets++ },
+		log:   slog.New(slog.DiscardHandler),
+	}
+	step := func(op, want string, wantResets int) {
+		t.Helper()
+		if got := watch.control(context.Background(), op); got != want {
+			t.Fatalf("control(%q) = %q, want %q", op, got, want)
+		}
+		if resets != wantResets {
+			t.Fatalf("after %q: %d resets, want %d", op, resets, wantResets)
+		}
+	}
+	step("refresh", "ok", 0) // the baseline
+	policy = policyOf(passthrough(allPorts, "*", "pypi.org"))
+	step("refresh", "ok", 0) // widened
+	policy = policyOf(passthrough(allPorts, "pypi.org"))
+	step("refresh", "ok narrowed", 1)
+	step("refresh", "ok", 1) // the same policy again
+	step("reset", "ok", 2)
+	fetchErr = errors.New("atelet is unreachable")
+	step("refresh", "err atelet is unreachable", 2)
+	step("suspend", "err unknown operation", 2)
+}
