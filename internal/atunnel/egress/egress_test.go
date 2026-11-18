@@ -649,3 +649,89 @@ func (c *closeNotifyingConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return err
 }
+
+func TestEgressResetStreamsClosesOpenTunnelsAndStaysActive(t *testing.T) {
+	var mu sync.Mutex
+	var gateways []net.Conn
+	dialer := tunnelDialerFunc(func(context.Context, string) (net.Conn, error) {
+		proxySide, gatewaySide := net.Pipe()
+		mu.Lock()
+		gateways = append(gateways, gatewaySide)
+		mu.Unlock()
+		return proxySide, nil
+	})
+	gateway := func(i int) net.Conn {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for {
+			mu.Lock()
+			if len(gateways) > i {
+				defer mu.Unlock()
+				return gateways[i]
+			}
+			mu.Unlock()
+			if time.Now().After(deadline) {
+				t.Fatalf("tunnel %d was not opened", i)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	egress, err := New(func(net.Conn) (string, error) { return "192.0.2.10:443", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := egress.Activate(testActorUID, dialer, fakeActorCertificateSource{expiresAt: time.Now().Add(time.Hour)}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = egress.Deactivate(context.Background(), testActorUID) }()
+
+	actor, proxy := net.Pipe()
+	defer actor.Close()
+	egress.handle(proxy, egress.active[testActorUID])
+	go func() { _, _ = actor.Write([]byte("before")) }()
+	if _, err := io.ReadFull(gateway(0), make([]byte, len("before"))); err != nil {
+		t.Fatalf("tunnel did not carry data before the reset: %v", err)
+	}
+
+	egress.ResetStreams(testActorUID)
+	if err := actor.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := actor.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read on the tunnel opened before the reset: %v, want EOF", err)
+	}
+
+	newActor, newProxy := net.Pipe()
+	defer newActor.Close()
+	egress.handle(newProxy, egress.active[testActorUID])
+	go func() { _, _ = newActor.Write([]byte("after")) }()
+	if _, err := io.ReadFull(gateway(1), make([]byte, len("after"))); err != nil {
+		t.Fatalf("tunnel opened after the reset did not carry data: %v", err)
+	}
+}
+
+func TestEgressGoRunsUntilDeactivate(t *testing.T) {
+	egress, err := New(func(net.Conn) (string, error) { return "192.0.2.10:443", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := tunnelDialerFunc(func(context.Context, string) (net.Conn, error) { return nil, errors.New("unused") })
+	if err := egress.Activate(testActorUID, dialer, fakeActorCertificateSource{expiresAt: time.Now().Add(time.Hour)}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	started, stopped := make(chan struct{}), make(chan struct{})
+	egress.Go(testActorUID, func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+	})
+	receiveWithin(t, started, "function started")
+	if err := egress.Deactivate(context.Background(), testActorUID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("Deactivate returned before the function did")
+	}
+}

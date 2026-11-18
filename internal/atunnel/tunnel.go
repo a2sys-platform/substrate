@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"time"
 
+	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/ateletdial"
 	"go.ate.dev/substrate/internal/atunnel/dns"
 	"go.ate.dev/substrate/internal/atunnel/egress"
@@ -246,6 +247,14 @@ func (t *Tunnel) ActivateEgress(actor resources.ActorAttribution, actorEgress *A
 	if err := t.Egress.Activate(actor.UID, actorEgress.client, actorEgress.certificateSource, actorEgress.expiresAt); err != nil {
 		return fmt.Errorf("while activating actor egress: %w", err)
 	}
+	watch := &egressPolicyWatch{
+		fetch:    t.fetchEgressPolicy(actor),
+		reset:    func() { t.Egress.ResetStreams(actor.UID) },
+		interval: egressPolicyWatchInterval,
+		delay:    egressStreamResetDelay,
+		log:      slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
+	}
+	t.Egress.Go(actor.UID, watch.run)
 	return nil
 }
 
