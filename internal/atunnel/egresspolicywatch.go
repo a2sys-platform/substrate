@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"go.ate.dev/substrate/internal/proto/ateletpb"
@@ -29,7 +30,9 @@ import (
 const (
 	// egressPolicyWatchInterval is how often an active actor's egress policy is
 	// read to see whether it stopped allowing a TLS passthrough destination.
-	egressPolicyWatchInterval = egressPolicyTTL
+	// It is the fallback for a change nobody announced on the control port; a
+	// caller that wants the change applied at once sends "refresh" there.
+	egressPolicyWatchInterval = time.Minute
 
 	// egressStreamResetDelay is how long after such a change the actor's open
 	// tunnels are closed. The gateway keeps deciding by the policy it cached,
@@ -54,6 +57,57 @@ type egressPolicyWatch struct {
 	// delay is the time from seeing the change to closing the tunnels.
 	delay time.Duration
 	log   *slog.Logger
+
+	// mu guards last and fetched, which run and control both advance.
+	mu      sync.Mutex
+	last    *ateletpb.EgressPolicy
+	fetched bool
+}
+
+// check reads the policy and reports whether it stopped allowing a TLS
+// passthrough destination since the last read. The first read is the baseline.
+func (w *egressPolicyWatch) check(ctx context.Context) (narrowed bool, err error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, egressPolicyFetchTimeout)
+	defer cancel()
+	policy, err := w.fetch(fetchCtx)
+	if err != nil {
+		// last stays, so a change made while atelet was unreachable is still
+		// seen afterwards.
+		return false, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	narrowed = w.fetched && passthroughNarrowed(w.last, policy)
+	w.last, w.fetched = policy, true
+	return narrowed, nil
+}
+
+// control runs one operation sent to the actor's control port and returns the
+// answer line.
+//
+//	refresh  reads the policy now. The DNS relay answers by it from here on,
+//	         and if it stopped allowing a passthrough destination the open
+//	         tunnels are closed. Answers "ok narrowed" or "ok".
+//	reset    closes the open tunnels. A caller sends it once the gateway's
+//	         policy cache has expired, to close a tunnel the old policy
+//	         authorized after refresh.
+func (w *egressPolicyWatch) control(ctx context.Context, op string) string {
+	switch op {
+	case "refresh":
+		narrowed, err := w.check(ctx)
+		if err != nil {
+			return "err " + err.Error()
+		}
+		if narrowed {
+			w.reset()
+			return "ok narrowed"
+		}
+		return "ok"
+	case "reset":
+		w.reset()
+		return "ok"
+	}
+	return "err unknown operation"
 }
 
 // run watches until ctx ends. The first policy it reads is the baseline, so
@@ -61,28 +115,17 @@ type egressPolicyWatch struct {
 func (w *egressPolicyWatch) run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
-	var (
-		last    *ateletpb.EgressPolicy
-		fetched bool
-		// resetAt fires when the tunnels are due to close; nil when none are.
-		resetAt <-chan time.Time
-	)
+	// resetAt fires when the tunnels are due to close; nil when none are.
+	var resetAt <-chan time.Time
 	for {
-		fetchCtx, cancel := context.WithTimeout(ctx, egressPolicyFetchTimeout)
-		policy, err := w.fetch(fetchCtx)
-		cancel()
+		narrowed, err := w.check(ctx)
 		switch {
 		case err != nil:
-			// Keep comparing against the last policy read, so a change made
-			// while atelet was unreachable is still seen afterwards.
 			w.log.DebugContext(ctx, "Could not read the actor's egress policy to watch it for changes", slog.Any("err", err))
-		case fetched && passthroughNarrowed(last, policy):
+		case narrowed:
 			// A later change restarts the delay: the tunnels it leaves behind
 			// were authorized until now.
 			resetAt = time.After(w.delay)
-			last = policy
-		default:
-			last, fetched = policy, true
 		}
 
 		select {

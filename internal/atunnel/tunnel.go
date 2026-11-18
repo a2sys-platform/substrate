@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"sync"
 	"time"
 
 	"go.ate.dev/substrate/internal/ateattr"
@@ -38,6 +39,7 @@ import (
 	"go.ate.dev/substrate/internal/installdefaults"
 	"go.ate.dev/substrate/internal/linuxsys"
 	"go.ate.dev/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/serverboot"
@@ -109,6 +111,24 @@ type Tunnel struct {
 	cfg Config
 	// ateletTLS is used to authenticate to atelet to fetch egress policies.
 	ateletTLS *tls.Config
+
+	// mu guards the per-actor egress state below, keyed by actor UID.
+	mu sync.Mutex
+	// dnsPolicies holds what each actor's DNS relay reads its policy from.
+	dnsPolicies map[string]*actorEgressPolicy
+	// watches holds each active actor's egress policy watch.
+	watches map[string]*egressPolicyWatch
+}
+
+// control answers a control-port operation for an actor.
+func (t *Tunnel) control(ctx context.Context, actorUID, op string) string {
+	t.mu.Lock()
+	watch := t.watches[actorUID]
+	t.mu.Unlock()
+	if watch == nil {
+		return "err actor has no active egress"
+	}
+	return watch.control(ctx, op)
 }
 
 // Start builds the DNS relay and starts serving actor ingress, which proxies
@@ -133,11 +153,17 @@ func Start(ctx context.Context, cfg Config, upstream string) (*Tunnel, error) {
 	}
 
 	// Ingress
+	tunnel := &Tunnel{
+		cfg:         cfg,
+		dnsPolicies: map[string]*actorEgressPolicy{},
+		watches:     map[string]*egressPolicyWatch{},
+	}
 	ingressServer, err := ingress.NewServer(ingress.Config{
 		CredentialBundlePath: cfg.CredentialBundle,
 		TrustBundlePath:      cfg.TrustBundle,
 		AllowedClientID:      cfg.ClientIdentity,
 		Upstream:             upstreamURL,
+		Control:              tunnel.control,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("configuring ingress: %w", err)
@@ -159,14 +185,12 @@ func Start(ctx context.Context, cfg Config, upstream string) (*Tunnel, error) {
 		return nil, err
 	}
 
-	return &Tunnel{
-			Ingress:    ingressServer,
-			Egress:     egressProxy,
-			EgressPort: egressPort,
-			DNSRelay:   dnsRelay,
-			cfg:        cfg,
-			ateletTLS:  ateletTLS},
-		nil
+	tunnel.Ingress = ingressServer
+	tunnel.Egress = egressProxy
+	tunnel.EgressPort = egressPort
+	tunnel.DNSRelay = dnsRelay
+	tunnel.ateletTLS = ateletTLS
+	return tunnel, nil
 }
 
 // serve listens on address and runs serveFn on it, exiting the process if it
@@ -247,13 +271,27 @@ func (t *Tunnel) ActivateEgress(actor resources.ActorAttribution, actorEgress *A
 	if err := t.Egress.Activate(actor.UID, actorEgress.client, actorEgress.certificateSource, actorEgress.expiresAt); err != nil {
 		return fmt.Errorf("while activating actor egress: %w", err)
 	}
+	fetch := t.fetchEgressPolicy(actor)
 	watch := &egressPolicyWatch{
-		fetch:    t.fetchEgressPolicy(actor),
+		// Reads through the DNS relay's source when the actor has one, so the
+		// relay answers by the policy the watch just read.
+		fetch: func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+			t.mu.Lock()
+			source := t.dnsPolicies[actor.UID]
+			t.mu.Unlock()
+			if source != nil {
+				return source.refresh(ctx)
+			}
+			return fetch(ctx)
+		},
 		reset:    func() { t.Egress.ResetStreams(actor.UID) },
 		interval: egressPolicyWatchInterval,
 		delay:    egressStreamResetDelay,
 		log:      slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
 	}
+	t.mu.Lock()
+	t.watches[actor.UID] = watch
+	t.mu.Unlock()
 	t.Egress.Go(actor.UID, watch.run)
 	return nil
 }
@@ -271,6 +309,10 @@ func (t *Tunnel) ActivateIngress(actor resources.ActorAttribution, dial ingress.
 // before the actor network is torn down. It attempts both directions even if
 // one fails.
 func (t *Tunnel) Deactivate(ctx context.Context, actor resources.ActorAttribution) error {
+	t.mu.Lock()
+	delete(t.watches, actor.UID)
+	delete(t.dnsPolicies, actor.UID)
+	t.mu.Unlock()
 	err := errors.Join(
 		t.Ingress.Deactivate(ctx, actor.Ref.Atespace, actor.Ref.Name, actor.UID),
 		t.Egress.Deactivate(ctx, actor.UID),
