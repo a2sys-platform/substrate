@@ -45,6 +45,7 @@ import (
 	"go.ate.dev/substrate/api/credprovider/v1"
 	"go.ate.dev/substrate/cmd/atenet/internal/router/egress/actorjwt"
 	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/atenet"
 	"go.ate.dev/substrate/internal/egresspolicy"
 	"go.ate.dev/substrate/internal/resources"
 )
@@ -184,7 +185,7 @@ func (h *Handler) handleConnect(ctx context.Context, md *extproc.RequestMetadata
 
 	// This also warms the cache for the requests inside the tunnel, and
 	// refuses an actor whose policy could allow nothing.
-	policy, err := h.lookupPolicy(ctx, leg, ref)
+	policy, err := h.lookupPolicy(ctx, leg, ref, policyVersion(md))
 	if err != nil {
 		return extproc.Result{}, err
 	}
@@ -250,8 +251,11 @@ func allow() extproc.Result {
 
 // lookupPolicy is the check every leg starts with. Every error it returns is
 // already a client-facing denial.
-func (h *Handler) lookupPolicy(ctx context.Context, leg string, ref resources.ActorRef) (*egresspolicy.Policy, error) {
-	policy, err := h.policies.get(ctx, ref)
+//
+// minVersion is the policy version the tunnel's CONNECT carried, or 0 for the
+// legs inside a tunnel, which the CONNECT has already brought up to date.
+func (h *Handler) lookupPolicy(ctx context.Context, leg string, ref resources.ActorRef, minVersion int64) (*egresspolicy.Policy, error) {
+	policy, err := h.policies.get(ctx, ref, minVersion)
 	switch {
 	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
 		// The caller gave up mid-fetch: not a decision.
@@ -270,6 +274,16 @@ func (h *Handler) lookupPolicy(ctx context.Context, leg string, ref resources.Ac
 		return nil, extproc.NewReqError(envoy_type.StatusCode_Forbidden, deniedBody)
 	}
 	return policy, nil
+}
+
+// policyVersion reads the policy version atunnel put on a CONNECT. A missing
+// or malformed value is 0, which asks for nothing newer than the cache.
+func policyVersion(md *extproc.RequestMetadata) int64 {
+	version, err := strconv.ParseInt(md.Headers[atenet.EgressPolicyVersionHeader], 10, 64)
+	if err != nil || version < 0 {
+		return 0
+	}
+	return version
 }
 
 // validateActor checks the actor certified by the certificate against the control

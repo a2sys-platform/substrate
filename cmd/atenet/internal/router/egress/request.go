@@ -66,7 +66,7 @@ func (h *Handler) handleRequest(ctx context.Context, md *extproc.RequestMetadata
 			slog.Any("actor", ref), slog.String("leg", leg), slog.Any("err", err))
 		return extproc.Result{}, extproc.WrapReqError(envoy_type.StatusCode_Forbidden, err, deniedBody)
 	}
-	policy, err := h.lookupPolicy(ctx, leg, ref)
+	policy, err := h.lookupPolicy(ctx, leg, ref, 0)
 	if err != nil {
 		return extproc.Result{}, err
 	}

@@ -28,11 +28,14 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.ate.dev/substrate/internal/atenet"
 )
 
 // TODO(liorlieberman): support/use CONNECT on Ingress as well.
@@ -93,6 +96,28 @@ type Client struct {
 	closed  bool
 	h2Conns []*h2ClientConn
 	dialing *dialCall
+
+	// policyVersion goes out on every CONNECT as EgressPolicyVersionHeader
+	// once it is set. Zero sends no header.
+	policyVersion atomic.Int64
+}
+
+// SetPolicyVersion makes later tunnels tell the gateway that the actor's
+// EgressPolicy has reached version. It never lowers the version.
+func (c *Client) SetPolicyVersion(version int64) {
+	for {
+		current := c.policyVersion.Load()
+		if version <= current || c.policyVersion.CompareAndSwap(current, version) {
+			return
+		}
+	}
+}
+
+// stampPolicyVersion adds the policy version to a CONNECT's headers.
+func (c *Client) stampPolicyVersion(header http.Header) {
+	if version := c.policyVersion.Load(); version > 0 {
+		header.Set(atenet.EgressPolicyVersionHeader, strconv.FormatInt(version, 10))
+	}
 }
 
 // Client implements tunnelDialer.
@@ -460,7 +485,9 @@ func (c *Client) connectH1(tlsConn *tls.Conn, destination string) (net.Conn, err
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: destination},
 		Host:   destination,
+		Header: make(http.Header),
 	}
+	c.stampPolicyVersion(req.Header)
 	if err := req.Write(tlsConn); err != nil {
 		_ = tlsConn.Close()
 		return nil, connectExchangeError("writing CONNECT request", err)
@@ -502,6 +529,7 @@ func (c *Client) connectH2(ctx context.Context, h2Conn *h2ClientConn, wasVerifie
 		Body:          reqBody,
 		ContentLength: -1,
 	}).WithContext(traceCtx)
+	c.stampPolicyVersion(req.Header)
 
 	resp, err := h2Conn.cc.RoundTrip(req)
 	if !stopCancel() {

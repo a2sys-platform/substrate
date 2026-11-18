@@ -37,6 +37,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"go.ate.dev/substrate/internal/atenet"
 )
 
 func TestClientDialContext(t *testing.T) {
@@ -1069,5 +1071,34 @@ func TestH2StreamConnWriteToHonorsReadDeadline(t *testing.T) {
 	}
 	if got.String() != "delayed" {
 		t.Errorf("got %q, want delayed", got.String())
+	}
+}
+
+func TestClientSendsThePolicyVersionOnConnect(t *testing.T) {
+	ca := newTestCA(t)
+	versions := make(chan string, 2)
+	gatewayAddr, _ := serveTestH2ConnectGateway(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		versions <- r.Header.Get(atenet.EgressPolicyVersionHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+	client := newTestClient(t, ca, withDialer(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, gatewayAddr)
+	}))
+	dial := func() string {
+		t.Helper()
+		stream, err := client.DialContext(context.Background(), "192.0.2.10:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = stream.Close()
+		return receiveWithin(t, versions, "CONNECT reached the gateway")
+	}
+	if got := dial(); got != "" {
+		t.Fatalf("version before any was set = %q", got)
+	}
+	client.SetPolicyVersion(7)
+	client.SetPolicyVersion(5) // never lowers
+	if got := dial(); got != "7" {
+		t.Fatalf("version = %q, want 7", got)
 	}
 }

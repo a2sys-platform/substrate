@@ -27,6 +27,14 @@ const (
 	// "<atespace>/<actor>". HTTP field names are case-insensitive; this uses its
 	// HTTP/2 wire form so dataplane configuration and metadata are native.
 	TargetActorHeader = "ate-target-actor"
+
+	// EgressPolicyVersionHeader is set by atunnel on the CONNECT it opens to
+	// the egress gateway: a version of the actor's EgressPolicy that atunnel
+	// knows exists. The gateway reads the policy again when what it has cached
+	// is older, so a change takes effect on the next tunnel instead of when
+	// the cache expires. An actor cannot set it: its bytes are the tunnel's
+	// payload, not the CONNECT.
+	EgressPolicyVersionHeader = "ate-egress-policy-version"
 )
 
 // ParseTargetActor parses and validates a TargetActorHeader value.

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -71,6 +72,12 @@ const minCleanupSize = 64
 type policyEntry struct {
 	policy  *egresspolicy.Policy
 	expires time.Time
+	// version is the newest policy version this fetch is known to be at least
+	// as new as: the fetched policy's own, or the version the caller asked
+	// for when the fetch came back with less (no policy, or a read that had
+	// not caught up). Recording the latter keeps one such answer from being
+	// fetched again on every tunnel; it expires with the TTL like any entry.
+	version int64
 }
 
 func newPolicyCache(client ateapi.ControlClient, ttl time.Duration) *policyCache {
@@ -85,8 +92,12 @@ func newPolicyCache(client ateapi.ControlClient, ttl time.Duration) *policyCache
 
 // get returns the actor's compiled policy, fetching when there is no live
 // entry, or errNoPolicy. Fetch errors are never cached.
-func (c *policyCache) get(ctx context.Context, ref resources.ActorRef) (*egresspolicy.Policy, error) {
-	if policy, ok := c.cached(ref); ok {
+//
+// minVersion is the policy version atunnel put on the tunnel's CONNECT, or 0.
+// An entry older than it is not live: the policy has changed since, and the
+// caller is deciding a tunnel opened after the change.
+func (c *policyCache) get(ctx context.Context, ref resources.ActorRef, minVersion int64) (*egresspolicy.Policy, error) {
+	if policy, ok := c.cached(ref, minVersion); ok {
 		if policy == nil {
 			return nil, errNoPolicy
 		}
@@ -95,15 +106,17 @@ func (c *policyCache) get(ctx context.Context, ref resources.ActorRef) (*egressp
 
 	// The fetch outlives the caller: the leader of a flight going away must
 	// not fail the callers that joined it.
-	ch := c.flight.DoChan(ref.String(), func() (any, error) {
+	// Keyed by version too: a fetch already in flight for an older version may
+	// have read before the change this caller knows of.
+	ch := c.flight.DoChan(ref.String()+"@"+strconv.FormatInt(minVersion, 10), func() (any, error) {
 		// A flight that finished between the miss above and DoChan has
 		// already stored a fresh entry.
-		if policy, ok := c.cached(ref); ok {
+		if policy, ok := c.cached(ref, minVersion); ok {
 			return policy, nil
 		}
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), policyFetchTimeout)
 		defer cancel()
-		return c.fetch(fetchCtx, ref)
+		return c.fetch(fetchCtx, ref, minVersion)
 	})
 	select {
 	case <-ctx.Done():
@@ -120,15 +133,16 @@ func (c *policyCache) get(ctx context.Context, ref resources.ActorRef) (*egressp
 	}
 }
 
-// cached returns ref's unexpired entry; a nil policy is a cached "no policy".
-func (c *policyCache) cached(ref resources.ActorRef) (*egresspolicy.Policy, bool) {
+// cached returns ref's unexpired entry if it is at least as new as
+// minVersion; a nil policy is a cached "no policy".
+func (c *policyCache) cached(ref resources.ActorRef, minVersion int64) (*egresspolicy.Policy, bool) {
 	if c.ttl <= 0 {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[ref]
-	if !ok || !c.now().Before(entry.expires) {
+	if !ok || !c.now().Before(entry.expires) || entry.version < minVersion {
 		return nil, false
 	}
 	return entry.policy, true
@@ -136,7 +150,7 @@ func (c *policyCache) cached(ref resources.ActorRef) (*egresspolicy.Policy, bool
 
 // fetch loads and compiles one actor's policy and stores the result. A nil
 // policy with a nil error is the stored form of "no policy".
-func (c *policyCache) fetch(ctx context.Context, ref resources.ActorRef) (*egresspolicy.Policy, error) {
+func (c *policyCache) fetch(ctx context.Context, ref resources.ActorRef, minVersion int64) (*egresspolicy.Policy, error) {
 	resp, err := c.client.GetActorEgressPolicy(ctx, &ateapi.GetActorEgressPolicyRequest{Actor: ref.ToObjectRef(), Name: resources.SingletonName})
 	var policy *egresspolicy.Policy
 	switch {
@@ -158,7 +172,7 @@ func (c *policyCache) fetch(ctx context.Context, ref resources.ActorRef) (*egres
 	if c.ttl > 0 {
 		c.mu.Lock()
 		now := c.now()
-		c.entries[ref] = policyEntry{policy: policy, expires: now.Add(c.ttl)}
+		c.entries[ref] = policyEntry{policy: policy, expires: now.Add(c.ttl), version: max(resp.GetMetadata().GetVersion(), minVersion)}
 		if len(c.entries) >= c.cleanupAt {
 			for k, e := range c.entries {
 				if !now.Before(e.expires) {

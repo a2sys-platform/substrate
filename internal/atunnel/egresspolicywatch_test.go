@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -40,7 +41,7 @@ var (
 	port443  = &ateletpb.EgressPorts{Numbers: []int32{443}}
 )
 
-func TestPassthroughNarrowed(t *testing.T) {
+func TestPolicyNarrowed(t *testing.T) {
 	httpOnly := policyOf(&ateletpb.EgressRule{Http: &ateletpb.EgressDestinations{Hostnames: []string{"*"}, Ports: allPorts}})
 	cases := []struct {
 		name       string
@@ -61,12 +62,13 @@ func TestPassthroughNarrowed(t *testing.T) {
 		{"ports narrowed", policyOf(passthrough(allPorts, "a.com")), policyOf(passthrough(port443, "a.com")), true},
 		{"ports widened", policyOf(passthrough(port443, "a.com")), policyOf(passthrough(allPorts, "a.com")), false},
 		{"passthrough replaced by http", policyOf(passthrough(allPorts, "*")), httpOnly, true},
-		{"http rule removed", httpOnly, nil, false},
+		{"http rule removed", httpOnly, nil, true},
+		{"http rule kept beside a new passthrough", httpOnly, policyOf(httpOnly.GetRules()[0], passthrough(allPorts, "a.com")), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := passthroughNarrowed(tc.prev, tc.next); got != tc.want {
-				t.Errorf("passthroughNarrowed = %v, want %v", got, tc.want)
+			if got := policyNarrowed(tc.prev, tc.next); got != tc.want {
+				t.Errorf("policyNarrowed = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -173,28 +175,34 @@ func TestEgressPolicyWatchControl(t *testing.T) {
 	policy := policyOf(passthrough(allPorts, "*"))
 	var fetchErr error
 	resets := 0
+	var stamps []int64
 	watch := &egressPolicyWatch{
 		fetch: func(context.Context) (*ateletpb.EgressPolicy, error) { return policy, fetchErr },
 		reset: func() { resets++ },
+		stamp: func(v int64) { stamps = append(stamps, v) },
 		log:   slog.New(slog.DiscardHandler),
 	}
-	step := func(op, want string, wantResets int) {
+	step := func(op, version, want string, wantResets int) {
 		t.Helper()
-		if got := watch.control(context.Background(), op); got != want {
-			t.Fatalf("control(%q) = %q, want %q", op, got, want)
+		if got := watch.control(context.Background(), op, version); got != want {
+			t.Fatalf("control(%q, %q) = %q, want %q", op, version, got, want)
 		}
 		if resets != wantResets {
 			t.Fatalf("after %q: %d resets, want %d", op, resets, wantResets)
 		}
 	}
-	step("refresh", "ok", 0) // the baseline
+	step("refresh", "", "ok", 0) // the baseline
 	policy = policyOf(passthrough(allPorts, "*", "pypi.org"))
-	step("refresh", "ok", 0) // widened
+	step("refresh", "4", "ok", 0) // widened
 	policy = policyOf(passthrough(allPorts, "pypi.org"))
-	step("refresh", "ok narrowed", 1)
-	step("refresh", "ok", 1) // the same policy again
-	step("reset", "ok", 2)
+	step("refresh", "5", "ok narrowed", 1)
+	step("refresh", "", "ok", 1) // the same policy again
+	step("reset", "", "ok", 2)
+	step("refresh", "zero", "err version must be a positive integer", 2)
 	fetchErr = errors.New("atelet is unreachable")
-	step("refresh", "err atelet is unreachable", 2)
-	step("suspend", "err unknown operation", 2)
+	step("refresh", "6", "err atelet is unreachable", 2)
+	step("suspend", "", "err unknown operation", 2)
+	if want := []int64{4, 5, 6}; !slices.Equal(stamps, want) {
+		t.Fatalf("stamps = %v, want %v", stamps, want)
+	}
 }

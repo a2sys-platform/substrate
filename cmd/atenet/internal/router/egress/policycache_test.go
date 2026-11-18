@@ -26,6 +26,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/atenet"
 	"go.ate.dev/substrate/internal/egresspolicy"
 	"go.ate.dev/substrate/internal/resources"
 )
@@ -45,7 +48,7 @@ func TestPolicyCacheServesFromCacheWithinTTL(t *testing.T) {
 	c, now := newTestCache(client, 10*time.Second)
 
 	for range 3 {
-		if _, err := c.get(context.Background(), testActorRef); err != nil {
+		if _, err := c.get(context.Background(), testActorRef, 0); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
@@ -54,7 +57,7 @@ func TestPolicyCacheServesFromCacheWithinTTL(t *testing.T) {
 	}
 
 	*now = now.Add(10*time.Second + time.Millisecond)
-	if _, err := c.get(context.Background(), testActorRef); err != nil {
+	if _, err := c.get(context.Background(), testActorRef, 0); err != nil {
 		t.Fatalf("get after expiry: %v", err)
 	}
 	if calls := client.policyCalls.Load(); calls != 2 {
@@ -68,7 +71,7 @@ func TestPolicyCacheCachesNoPolicy(t *testing.T) {
 	c, _ := newTestCache(client, 10*time.Second)
 
 	for range 3 {
-		if _, err := c.get(context.Background(), testActorRef); !errors.Is(err, errNoPolicy) {
+		if _, err := c.get(context.Background(), testActorRef, 0); !errors.Is(err, errNoPolicy) {
 			t.Fatalf("get = %v, want errNoPolicy", err)
 		}
 	}
@@ -82,11 +85,11 @@ func TestPolicyCacheDoesNotCacheFetchErrors(t *testing.T) {
 	client := &egressMockClient{policy: allowAllPolicy(), policyErr: status.Error(codes.Unavailable, "ateapi is down")}
 	c, _ := newTestCache(client, 10*time.Second)
 
-	if _, err := c.get(context.Background(), testActorRef); status.Code(errors.Unwrap(err)) != codes.Unavailable {
+	if _, err := c.get(context.Background(), testActorRef, 0); status.Code(errors.Unwrap(err)) != codes.Unavailable {
 		t.Fatalf("get = %v, want the Unavailable fetch error", err)
 	}
 	client.policyErr = nil
-	if _, err := c.get(context.Background(), testActorRef); err != nil {
+	if _, err := c.get(context.Background(), testActorRef, 0); err != nil {
 		t.Fatalf("get after ateapi recovered: %v", err)
 	}
 	if calls := client.policyCalls.Load(); calls != 2 {
@@ -99,7 +102,7 @@ func TestPolicyCacheDisabledFetchesEveryTime(t *testing.T) {
 	c, _ := newTestCache(client, 0)
 
 	for range 3 {
-		if _, err := c.get(context.Background(), testActorRef); err != nil {
+		if _, err := c.get(context.Background(), testActorRef, 0); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
@@ -121,7 +124,7 @@ func TestPolicyCacheCollapsesConcurrentFetches(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, err := c.get(context.Background(), testActorRef)
+				_, err := c.get(context.Background(), testActorRef, 0)
 				errs <- err
 			}()
 		}
@@ -153,7 +156,7 @@ func TestPolicyCacheFetchOutlivesCanceledCaller(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.get(ctx, testActorRef)
+		_, err := c.get(ctx, testActorRef, 0)
 		done <- err
 	}()
 	deadline := time.Now().Add(5 * time.Second)
@@ -169,7 +172,7 @@ func TestPolicyCacheFetchOutlivesCanceledCaller(t *testing.T) {
 	}
 
 	close(client.policyGate)
-	if _, err := c.get(context.Background(), testActorRef); err != nil {
+	if _, err := c.get(context.Background(), testActorRef, 0); err != nil {
 		t.Fatalf("get after the detached fetch completed: %v", err)
 	}
 	if calls := client.policyCalls.Load(); calls != 1 {
@@ -183,18 +186,18 @@ func TestPolicyCacheExpiryBoundaryAndUpdateVisibility(t *testing.T) {
 	client := &egressMockClient{policy: httpPolicy("old.example")}
 	c, now := newTestCache(client, 10*time.Second)
 
-	before, err := c.get(context.Background(), testActorRef)
+	before, err := c.get(context.Background(), testActorRef, 0)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	client.policy = httpPolicy("new.example")
 
 	*now = now.Add(10*time.Second - time.Nanosecond)
-	if p, _ := c.get(context.Background(), testActorRef); p != before {
+	if p, _ := c.get(context.Background(), testActorRef, 0); p != before {
 		t.Fatal("entry refetched before its TTL elapsed")
 	}
 	*now = now.Add(time.Nanosecond)
-	after, err := c.get(context.Background(), testActorRef)
+	after, err := c.get(context.Background(), testActorRef, 0)
 	if err != nil {
 		t.Fatalf("get after expiry: %v", err)
 	}
@@ -211,7 +214,7 @@ func TestPolicyCacheRemovesExpiredEntries(t *testing.T) {
 
 	for i := range minCleanupSize {
 		ref := resources.ActorRef{Atespace: "a", Name: fmt.Sprintf("actor-%d", i)}
-		if _, err := c.get(context.Background(), ref); err != nil {
+		if _, err := c.get(context.Background(), ref, 0); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
@@ -220,7 +223,7 @@ func TestPolicyCacheRemovesExpiredEntries(t *testing.T) {
 	*now = now.Add(11 * time.Second)
 	for i := range minCleanupSize {
 		ref := resources.ActorRef{Atespace: "b", Name: fmt.Sprintf("actor-%d", i)}
-		if _, err := c.get(context.Background(), ref); err != nil {
+		if _, err := c.get(context.Background(), ref, 0); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
@@ -229,5 +232,45 @@ func TestPolicyCacheRemovesExpiredEntries(t *testing.T) {
 	c.mu.Unlock()
 	if n != minCleanupSize {
 		t.Errorf("cache holds %d entries, want only the %d live ones after the cleanup", n, minCleanupSize)
+	}
+}
+
+// A tunnel whose CONNECT names a newer policy version than the cache holds is
+// decided by a fresh read, without waiting for the TTL.
+func TestPolicyCacheRefetchesForANewerVersion(t *testing.T) {
+	policy := allowAllPolicy()
+	policy.Metadata = &ateapi.ResourceMetadata{Version: 3}
+	client := &egressMockClient{policy: policy}
+	c, _ := newTestCache(client, 10*time.Second)
+	get := func(minVersion int64, wantCalls int32) {
+		t.Helper()
+		if _, err := c.get(context.Background(), testActorRef, minVersion); err != nil {
+			t.Fatalf("get(%d): %v", minVersion, err)
+		}
+		if calls := client.policyCalls.Load(); calls != wantCalls {
+			t.Fatalf("after get(%d): GetActorEgressPolicy calls = %d, want %d", minVersion, calls, wantCalls)
+		}
+	}
+	get(0, 1)
+	get(3, 1) // the cached read is already version 3
+	get(2, 1)
+	policy.Metadata.Version = 4
+	get(4, 2) // newer than the cache: read again
+	get(4, 2)
+	get(0, 2) // the legs inside the tunnel use what the CONNECT fetched
+	// A read that comes back older than asked is not repeated on every tunnel.
+	get(9, 3)
+	get(9, 3)
+}
+
+func TestPolicyVersionReadsTheConnectHeader(t *testing.T) {
+	for value, want := range map[string]int64{"7": 7, "": 0, "x": 0, "-1": 0} {
+		md := &extproc.RequestMetadata{Headers: map[string]string{}}
+		if value != "" {
+			md.Headers[atenet.EgressPolicyVersionHeader] = value
+		}
+		if got := policyVersion(md); got != want {
+			t.Errorf("policyVersion(%q) = %d, want %d", value, got, want)
+		}
 	}
 }

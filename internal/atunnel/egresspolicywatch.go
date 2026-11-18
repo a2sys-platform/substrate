@@ -20,6 +20,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,29 +30,32 @@ import (
 
 const (
 	// egressPolicyWatchInterval is how often an active actor's egress policy is
-	// read to see whether it stopped allowing a TLS passthrough destination.
-	// It is the fallback for a change nobody announced on the control port; a
-	// caller that wants the change applied at once sends "refresh" there.
+	// read to see whether it stopped allowing a destination. It is the
+	// fallback for a change nobody announced on the control port; a caller
+	// that wants the change applied at once sends "refresh" there.
 	egressPolicyWatchInterval = time.Minute
 
-	// egressStreamResetDelay is how long after such a change the actor's open
-	// tunnels are closed. The gateway keeps deciding by the policy it cached,
-	// for up to its --egress-policy-cache-ttl (10s by default), so a tunnel
-	// opened in that time can still be one the old policy authorized. Closing
-	// only once it has passed leaves none of those open.
+	// egressStreamResetDelay is how long after the fallback sees such a change
+	// the actor's open tunnels are closed. Without a policy version to send,
+	// the gateway keeps deciding by the policy it cached for up to its
+	// --egress-policy-cache-ttl (10s by default), so a tunnel opened in that
+	// time can still be one the old policy authorized. Closing only once it
+	// has passed leaves none of those open.
 	egressStreamResetDelay = 10 * time.Second
 )
 
 // egressPolicyWatch closes an actor's open egress tunnels after its egress
-// policy stops allowing a TLS passthrough destination.
+// policy stops allowing a destination.
 //
-// The gateway authorizes a passthrough tunnel once, at its ClientHello, and
-// need not close it when the policy changes. Without this watch a workload
-// keeps reaching a destination the policy no longer allows for as long as it
-// holds a connection opened earlier.
+// The gateway decides a TLS passthrough tunnel once, at its ClientHello, and
+// decides the requests inside any other tunnel by the policy it has cached.
+// Closing the tunnels makes the actor open new ones, which the gateway decides
+// afresh.
 type egressPolicyWatch struct {
 	fetch func(context.Context) (*ateletpb.EgressPolicy, error)
 	reset func()
+	// stamp makes later tunnels carry a policy version to the gateway.
+	stamp func(version int64)
 	// interval is the time between reads of the policy.
 	interval time.Duration
 	// delay is the time from seeing the change to closing the tunnels.
@@ -64,8 +68,8 @@ type egressPolicyWatch struct {
 	fetched bool
 }
 
-// check reads the policy and reports whether it stopped allowing a TLS
-// passthrough destination since the last read. The first read is the baseline.
+// check reads the policy and reports whether it stopped allowing a
+// destination since the last read. The first read is the baseline.
 func (w *egressPolicyWatch) check(ctx context.Context) (narrowed bool, err error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, egressPolicyFetchTimeout)
 	defer cancel()
@@ -77,7 +81,7 @@ func (w *egressPolicyWatch) check(ctx context.Context) (narrowed bool, err error
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	narrowed = w.fetched && passthroughNarrowed(w.last, policy)
+	narrowed = w.fetched && policyNarrowed(w.last, policy)
 	w.last, w.fetched = policy, true
 	return narrowed, nil
 }
@@ -86,14 +90,26 @@ func (w *egressPolicyWatch) check(ctx context.Context) (narrowed bool, err error
 // answer line.
 //
 //	refresh  reads the policy now. The DNS relay answers by it from here on,
-//	         and if it stopped allowing a passthrough destination the open
-//	         tunnels are closed. Answers "ok narrowed" or "ok".
-//	reset    closes the open tunnels. A caller sends it once the gateway's
-//	         policy cache has expired, to close a tunnel the old policy
-//	         authorized after refresh.
-func (w *egressPolicyWatch) control(ctx context.Context, op string) string {
+//	         and if it stopped allowing a destination the open tunnels are
+//	         closed. With a version, later tunnels carry it to the gateway,
+//	         which then decides them by a policy at least that new. Answers
+//	         "ok narrowed" or "ok".
+//	reset    closes the open tunnels. A caller whose gateway does not read the
+//	         version sends it once the gateway's policy cache has expired, to
+//	         close a tunnel the old policy authorized after refresh.
+func (w *egressPolicyWatch) control(ctx context.Context, op, version string) string {
 	switch op {
 	case "refresh":
+		if version != "" {
+			v, err := strconv.ParseInt(version, 10, 64)
+			if err != nil || v <= 0 {
+				return "err version must be a positive integer"
+			}
+			// Before the tunnels close: every tunnel opened from here on
+			// carries the version, and the ones opened before it are the ones
+			// reset closes.
+			w.stamp(v)
+		}
 		narrowed, err := w.check(ctx)
 		if err != nil {
 			return "err " + err.Error()
@@ -133,34 +149,39 @@ func (w *egressPolicyWatch) run(ctx context.Context) {
 			return
 		case <-resetAt:
 			resetAt = nil
-			w.log.InfoContext(ctx, "Closing the actor's open egress tunnels: its egress policy stopped allowing a TLS passthrough destination")
+			w.log.InfoContext(ctx, "Closing the actor's open egress tunnels: its egress policy stopped allowing a destination")
 			w.reset()
 		case <-ticker.C:
 		}
 	}
 }
 
-// passthroughNarrowed reports whether next stops allowing a TLS passthrough
-// destination that prev allowed. HTTP and intercepted HTTPS do not count: the
-// gateway authorizes those per request. It compares the rules as written and
-// errs toward true, which only costs the actor a reconnect.
-func passthroughNarrowed(prev, next *ateletpb.EgressPolicy) bool {
-	for _, rule := range prev.GetRules() {
-		allowed := rule.GetTlsPassthrough()
-		for _, hostname := range allowed.GetHostnames() {
-			if !passthroughAllows(next, hostname, allowed.GetPorts()) {
-				return true
+// policyNarrowed reports whether next stops allowing a destination that prev
+// allowed. It compares the rules of each protocol as written and errs toward
+// true, which only costs the actor a reconnect.
+func policyNarrowed(prev, next *ateletpb.EgressPolicy) bool {
+	for _, destinations := range []func(*ateletpb.EgressRule) *ateletpb.EgressDestinations{
+		(*ateletpb.EgressRule).GetHttp,
+		(*ateletpb.EgressRule).GetHttps,
+		(*ateletpb.EgressRule).GetTlsPassthrough,
+	} {
+		for _, rule := range prev.GetRules() {
+			allowed := destinations(rule)
+			for _, hostname := range allowed.GetHostnames() {
+				if !allows(next, destinations, hostname, allowed.GetPorts()) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-// passthroughAllows reports whether one passthrough rule of policy allows the
-// hostname pattern on all of ports.
-func passthroughAllows(policy *ateletpb.EgressPolicy, hostname string, ports *ateletpb.EgressPorts) bool {
+// allows reports whether one rule of policy, under the protocol destinations
+// reads, allows the hostname pattern on all of ports.
+func allows(policy *ateletpb.EgressPolicy, destinations func(*ateletpb.EgressRule) *ateletpb.EgressDestinations, hostname string, ports *ateletpb.EgressPorts) bool {
 	for _, rule := range policy.GetRules() {
-		allowed := rule.GetTlsPassthrough()
+		allowed := destinations(rule)
 		if allowed == nil || !portsCover(allowed.GetPorts(), ports) {
 			continue
 		}
