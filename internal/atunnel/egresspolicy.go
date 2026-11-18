@@ -74,17 +74,23 @@ type actorEgressPolicy struct {
 // relay.
 func (t *Tunnel) ActorEgressPolicy(actor resources.ActorAttribution) dns.PolicySource {
 	return &actorEgressPolicy{
-		fetch: func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
-			conn, err := ateletdial.Dial(nodepath.WorkerSupportSocket, t.ateletTLS)
-			if err != nil {
-				return nil, err
-			}
-			defer conn.Close()
-			return getEgressPolicy(ctx, ateletpb.NewWorkerSupportClient(conn), actor.Ref)
-		},
-		ttl: egressPolicyTTL,
-		now: time.Now,
-		log: slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
+		fetch: t.fetchEgressPolicy(actor),
+		ttl:   egressPolicyTTL,
+		now:   time.Now,
+		log:   slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),
+	}
+}
+
+// fetchEgressPolicy returns a function that reads actor's egress policy from
+// atelet, yielding nil if the actor has none.
+func (t *Tunnel) fetchEgressPolicy(actor resources.ActorAttribution) func(context.Context) (*ateletpb.EgressPolicy, error) {
+	return func(ctx context.Context) (*ateletpb.EgressPolicy, error) {
+		conn, err := ateletdial.Dial(nodepath.WorkerSupportSocket, t.ateletTLS)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		return getEgressPolicy(ctx, ateletpb.NewWorkerSupportClient(conn), actor.Ref)
 	}
 }
 

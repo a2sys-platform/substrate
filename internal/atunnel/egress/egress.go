@@ -67,6 +67,11 @@ type activation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// streams scopes the tunnels that are open now. ResetStreams cancels it and
+	// installs a new one, so tunnels opened afterwards are not affected.
+	streams       context.Context
+	cancelStreams context.CancelFunc
 }
 
 // New creates an activation-aware egress proxy.
@@ -111,6 +116,7 @@ func (e *Proxy) activationLocked(actorUID string) *activation {
 	if active == nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		active = &activation{actorUID: actorUID, ctx: ctx, cancel: cancel}
+		active.streams, active.cancelStreams = context.WithCancel(ctx)
 		e.active[actorUID] = active
 	}
 	return active
@@ -249,6 +255,38 @@ func waitForRenewal(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
+// Go runs fn for as long as the actor's egress stays active: its context ends
+// at Deactivate, which waits for fn to return. It does nothing for an actor
+// whose egress is not active.
+func (e *Proxy) Go(actorUID string, fn func(context.Context)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	active := e.active[actorUID]
+	if active == nil || active.dialer == nil || active.ctx.Err() != nil {
+		return
+	}
+	active.wg.Add(1)
+	go func() {
+		defer active.wg.Done()
+		fn(active.ctx)
+	}()
+}
+
+// ResetStreams closes the tunnels the actor has open and leaves its egress
+// active, so the actor can open new ones right away. The gateway authorizes a
+// TLS passthrough tunnel once, when it opens; closing the tunnels is how a
+// policy that no longer allows a destination reaches the ones already open.
+func (e *Proxy) ResetStreams(actorUID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	active := e.active[actorUID]
+	if active == nil || active.ctx.Err() != nil {
+		return
+	}
+	active.cancelStreams()
+	active.streams, active.cancelStreams = context.WithCancel(active.ctx)
+}
+
 // Deactivate disables the actor's egress and closes and drains its streams.
 func (e *Proxy) Deactivate(ctx context.Context, actorUID string) error {
 	e.mu.Lock()
@@ -308,6 +346,9 @@ func (e *Proxy) handle(downstream net.Conn, active *activation) {
 		return
 	}
 	active.wg.Add(1)
+	// Captured under the lock: a ResetStreams after this point closes this
+	// tunnel too, even if it is still being opened.
+	streams := active.streams
 	e.mu.Unlock()
 
 	go func() {
@@ -319,7 +360,7 @@ func (e *Proxy) handle(downstream net.Conn, active *activation) {
 			slog.WarnContext(active.ctx, "atunnel failed to resolve original egress destination", slog.Any("err", err))
 			return
 		}
-		dialCtx, cancelDial := context.WithTimeout(active.ctx, e.tunnelOpenTimeout)
+		dialCtx, cancelDial := context.WithTimeout(streams, e.tunnelOpenTimeout)
 		upstream, err := active.dialer.DialContext(dialCtx, destination)
 		cancelDial()
 		if err != nil {
@@ -328,7 +369,7 @@ func (e *Proxy) handle(downstream net.Conn, active *activation) {
 		}
 		defer upstream.Close()
 
-		stop := context.AfterFunc(active.ctx, func() {
+		stop := context.AfterFunc(streams, func() {
 			_ = downstream.Close()
 			_ = upstream.Close()
 		})
