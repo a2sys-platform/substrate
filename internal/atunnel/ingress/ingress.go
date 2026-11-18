@@ -60,8 +60,9 @@ const (
 )
 
 // ControlFunc runs one control operation for the actor with the given UID and
-// returns the line to answer with.
-type ControlFunc func(ctx context.Context, actorUID, op string) string
+// returns the line to answer with. version is the request's "version" query
+// parameter, empty when absent.
+type ControlFunc func(ctx context.Context, actorUID, op, version string) string
 
 // ParsePort parses s as a TCP port number, returning ok=false for anything
 // outside the valid 1-65535 range (including non-numeric input).
@@ -389,8 +390,9 @@ func (s *Server) serveConnectHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // controlConn returns the tunnel end of a connection whose other end is an
-// HTTP server for the actor's control operations: POST /<operation> answers
-// 200 with the operation's answer line, or 502 when the answer is an error.
+// HTTP server for the actor's control operations: POST /<operation>[?version=N]
+// answers 200 with the operation's answer line, or 502 when the answer is an
+// error.
 // The router only carries HTTP inside a CONNECT tunnel, so the control port
 // speaks HTTP like an actor's own port would.
 func (s *Server) controlConn(actorUID string) net.Conn {
@@ -407,7 +409,7 @@ func (s *Server) controlConn(actorUID string) net.Conn {
 				http.Error(w, "POST required", http.StatusMethodNotAllowed)
 				return
 			}
-			answer := s.control(r.Context(), actorUID, strings.TrimPrefix(r.URL.Path, "/"))
+			answer := s.control(r.Context(), actorUID, strings.TrimPrefix(r.URL.Path, "/"), r.URL.Query().Get("version"))
 			if strings.HasPrefix(answer, "err") {
 				http.Error(w, answer, http.StatusBadGateway)
 				return

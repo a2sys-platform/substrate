@@ -121,14 +121,14 @@ type Tunnel struct {
 }
 
 // control answers a control-port operation for an actor.
-func (t *Tunnel) control(ctx context.Context, actorUID, op string) string {
+func (t *Tunnel) control(ctx context.Context, actorUID, op, version string) string {
 	t.mu.Lock()
 	watch := t.watches[actorUID]
 	t.mu.Unlock()
 	if watch == nil {
 		return "err actor has no active egress"
 	}
-	return watch.control(ctx, op)
+	return watch.control(ctx, op, version)
 }
 
 // Start builds the DNS relay and starts serving actor ingress, which proxies
@@ -285,6 +285,7 @@ func (t *Tunnel) ActivateEgress(actor resources.ActorAttribution, actorEgress *A
 			return fetch(ctx)
 		},
 		reset:    func() { t.Egress.ResetStreams(actor.UID) },
+		stamp:    actorEgress.client.SetPolicyVersion,
 		interval: egressPolicyWatchInterval,
 		delay:    egressStreamResetDelay,
 		log:      slog.New(slog.Default().Handler().WithAttrs(ateattr.ActorLogAttrs(actor))),

@@ -1386,9 +1386,9 @@ func TestIngressReincarnationSurvivesStaleDeactivate(t *testing.T) {
 
 func TestControlConnServesOperationsOverHTTP(t *testing.T) {
 	var gotUID string
-	s := &Server{control: func(_ context.Context, actorUID, op string) string {
+	s := &Server{control: func(_ context.Context, actorUID, op, version string) string {
 		gotUID = actorUID
-		if op == "refresh" {
+		if op == "refresh" && version == "7" {
 			return "ok narrowed"
 		}
 		return "err unknown operation"
@@ -1408,7 +1408,7 @@ func TestControlConnServesOperationsOverHTTP(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, strings.TrimSpace(string(body))
 	}
-	if code, body := post("refresh"); code != http.StatusOK || body != "ok narrowed" || gotUID != "uid-1" {
+	if code, body := post("refresh?version=7"); code != http.StatusOK || body != "ok narrowed" || gotUID != "uid-1" {
 		t.Fatalf("refresh: %d %q, uid %q", code, body, gotUID)
 	}
 	if code, body := post("nope"); code != http.StatusBadGateway || body != "err unknown operation" {
